@@ -6,26 +6,23 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"sync/atomic"
 	"time"
 )
 
 const (
-	FunctionBackendURL = "https://us-east1-powerful-vine-486914-k3.cloudfunctions.net/geo_average"
+	FunctionBackendURL = "https://us-east1-powerful-vine-486914-k3.cloudfunctions.net"
 	VMBackendURL       = "http://10.142.0.3:8080"
 
-	// Where the broker listens
-	ListenAddr = ":8080"
-
-	// Buffer size to allow safe retry on POST/PUT/PATCH
+	ListenAddr   = ":8080"
 	MaxBodyBytes = int64(2 << 20) // 2MB
 )
 
 type Backend struct {
-	Name  string
-	Proxy *httputil.ReverseProxy
+	Name      string // "serverless" or "vm"
+	BaseURL   *url.URL
+	Transport http.RoundTripper
 }
 
 type Broker struct {
@@ -55,27 +52,25 @@ func main() {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 
-	functionProxy := newReverseProxy("function", functionURL, transport)
-	vmProxy := newReverseProxy("vm", vmURL, transport)
-
 	b := &Broker{
 		backends: []Backend{
-			{Name: "function", Proxy: functionProxy},
-			{Name: "vm", Proxy: vmProxy},
+			{Name: "serverless", BaseURL: functionURL, Transport: transport},
+			{Name: "vm", BaseURL: vmURL, Transport: transport},
 		},
 	}
 
 	mux := http.NewServeMux()
 
-	// Broker health endpoint
+	// Health endpoint
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	// Proxy everything else (path is preserved for both backends)
+	// Main proxy handler (preserves path for both)
 	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Buffer body for safe retry (POST/PUT/PATCH)
+		// Buffer body to allow retry on POST/PUT/PATCH
 		var bodyCopy []byte
 		var err error
 		if r.Body != nil && (r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch) {
@@ -86,7 +81,7 @@ func main() {
 			}
 		}
 
-		// Round robin selection
+		// Round robin
 		i := int(b.rr.Add(1) % uint64(len(b.backends)))
 		first := b.backends[i]
 		second := b.backends[(i+1)%len(b.backends)]
@@ -109,64 +104,72 @@ func main() {
 	}
 
 	log.Printf("Broker listening on %s", ListenAddr)
-	log.Printf("Function base: %s", functionURL.String())
-	log.Printf("VM base:       %s", vmURL.String())
+	log.Printf("Serverless base: %s", functionURL.String())
+	log.Printf("VM base:         %s", vmURL.String())
 	log.Fatal(srv.ListenAndServe())
 }
 
+// serveBackend forwards the request to the chosen backend.
+// It sets response headers to indicate which backend was used and the final URL.
 func serveBackend(be Backend, w http.ResponseWriter, r *http.Request, bodyCopy []byte) bool {
-	r2 := r.Clone(r.Context())
+	// Build final destination URL: base + incoming path + query
+	targetURL := joinURL(be.BaseURL, r.URL.Path, r.URL.RawQuery)
 
-	// Restore body for retry
-	if bodyCopy != nil && (r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch) {
-		r2.Body = io.NopCloser(bytes.NewReader(bodyCopy))
-		r2.ContentLength = int64(len(bodyCopy))
-	}
-
-	rec := &statusRecorder{ResponseWriter: w, code: 0}
-	be.Proxy.ServeHTTP(rec, r2)
-
-	// Treat these as failures to trigger failover
-	if rec.code == http.StatusBadGateway || rec.code == http.StatusServiceUnavailable || rec.code == http.StatusGatewayTimeout {
-		log.Printf("Backend %s returned %d -> failover", be.Name, rec.code)
+	// Create outbound request
+	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, nil)
+	if err != nil {
+		log.Printf("request build error (%s): %v", be.Name, err)
 		return false
 	}
 
-	// If WriteHeader was never called, code remains 0 (assume OK)
-	return true
-}
+	// Copy headers (excluding Hop-by-hop headers)
+	copyHeaders(outReq.Header, r.Header)
+	outReq.Host = be.BaseURL.Host
 
-type statusRecorder struct {
-	http.ResponseWriter
-	code int
-}
-
-func (s *statusRecorder) WriteHeader(code int) {
-	s.code = code
-	s.ResponseWriter.WriteHeader(code)
-}
-
-func newReverseProxy(name string, target *url.URL, transport http.RoundTripper) *httputil.ReverseProxy {
-	p := httputil.NewSingleHostReverseProxy(target)
-
-	orig := p.Director
-	p.Director = func(r *http.Request) {
-		orig(r)
-		// Useful forwarding headers
-		r.Header.Set("X-Forwarded-Host", r.Host)
-		if r.TLS != nil {
-			r.Header.Set("X-Forwarded-Proto", "https")
-		} else {
-			r.Header.Set("X-Forwarded-Proto", "http")
+	// Restore body if needed
+	if bodyCopy != nil && (r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch) {
+		outReq.Body = io.NopCloser(bytes.NewReader(bodyCopy))
+		outReq.ContentLength = int64(len(bodyCopy))
+	} else {
+		// For GET etc, forward original body if any (rare), else nil
+		if r.Body != nil && r.Body != http.NoBody {
+			// Not buffering for methods other than POST/PUT/PATCH
+			outReq.Body = r.Body
 		}
 	}
 
-	p.Transport = transport
-	p.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("Proxy error (%s): %v", name, err)
-		http.Error(w, "Bad gateway", http.StatusBadGateway)
+	// Do request
+	resp, err := (&http.Client{Transport: be.Transport}).Do(outReq)
+	if err != nil {
+		log.Printf("backend call error (%s) url=%s err=%v", be.Name, targetURL, err)
+		return false
 	}
-	return p
+	defer func() { _ = resp.Body.Close() }()
+
+	// If upstream is "bad gateway-ish", allow failover
+	if resp.StatusCode == http.StatusBadGateway || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout {
+		log.Printf("backend %s returned %d url=%s -> failover", be.Name, resp.StatusCode, targetURL)
+		return false
+	}
+
+	// ---- IMPORTANT: write headers BEFORE writing body ----
+	// Indicate which backend served the request + the final URL used
+	w.Header().Set("X-Selected-Backend", be.Name) // "serverless" or "vm"
+	w.Header().Set("X-Selected-URL", targetURL)
+
+	// Copy upstream headers to client (you can filter if you want)
+	copyHeaders(w.Header(), resp.Header)
+
+	// Write status code
+	w.WriteHeader(resp.StatusCode)
+
+	// Stream body
+	_, _ = io.Copy(w, resp.Body)
+
+	// Log (optional)
+	// log.Printf("served via=%s url=%s status=%d", be.Name, targetURL, resp.StatusCode)
+
+	return true
 }
 
 func mustParseURL(s string) *url.URL {
@@ -187,4 +190,67 @@ func readUpTo(rc io.ReadCloser, max int64) ([]byte, error) {
 		return nil, io.ErrUnexpectedEOF
 	}
 	return b, nil
+}
+
+// joinURL combines base URL + path + query into a full URL string.
+func joinURL(base *url.URL, path string, rawQuery string) string {
+	u := *base // copy
+	if path == "" {
+		path = "/"
+	}
+	// Ensure proper slashes:
+	// base.Path usually empty; we want base + incoming path
+	if u.Path == "" || u.Path == "/" {
+		u.Path = path
+	} else {
+		// If base has path and incoming has path, join safely
+		u.Path = stringsTrimRightSlash(u.Path) + "/" + stringsTrimLeftSlash(path)
+	}
+	u.RawQuery = rawQuery
+	return u.String()
+}
+
+func stringsTrimLeftSlash(s string) string {
+	for len(s) > 0 && s[0] == '/' {
+		s = s[1:]
+	}
+	return s
+}
+
+func stringsTrimRightSlash(s string) string {
+	for len(s) > 0 && s[len(s)-1] == '/' {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
+// copyHeaders copies headers from src to dst, skipping hop-by-hop headers.
+func copyHeaders(dst, src http.Header) {
+	// Hop-by-hop headers per RFC 7230 section 6.1
+	// We remove them to avoid proxy issues.
+	hopByHop := map[string]bool{
+		"Connection":          true,
+		"Proxy-Connection":    true,
+		"Keep-Alive":          true,
+		"Proxy-Authenticate":  true,
+		"Proxy-Authorization": true,
+		"Te":                  true,
+		"Trailer":             true,
+		"Transfer-Encoding":   true,
+		"Upgrade":             true,
+	}
+
+	for k, vv := range src {
+		if hopByHop[k] {
+			continue
+		}
+		// Don't forward our own selection headers from client
+		if k == "X-Selected-Backend" || k == "X-Selected-URL" {
+			continue
+		}
+		dst.Del(k)
+		for _, v := range vv {
+			dst.Add(k, v)
+		}
+	}
 }

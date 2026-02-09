@@ -1,1 +1,1 @@
-go run client.go -url "https://URL" -n 1000000 -c 2000 -timeout 10s
+go run client.go -url "http://34.26.8.185:8080/geo_average" -n 1000000 -c 2000 -timeout 10s
