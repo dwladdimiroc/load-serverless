@@ -1,1 +1,1 @@
-go run main.go -url "https://URL" -n 1000000 -c 2000 -timeout 10s
+go run client.go -url "https://URL" -n 1000000 -c 2000 -timeout 10s
