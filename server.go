@@ -78,13 +78,13 @@ func main() {
 	gb.Post("/geo_average", func(ctx gearbox.Context) {
 		var req AvgRequest
 		if err := ctx.ParseBody(&req); err != nil {
-			ctx.Status(gearbox.StatusBadRequest).SendString("JSON inválido")
+			ctx.Status(gearbox.StatusBadRequest).SendString("Invalid JSON body")
 			return
 		}
 
 		avg, ok := AverageLatLngSpherical(req.Points)
 		if !ok {
-			ctx.Status(gearbox.StatusBadRequest).SendString("Debes enviar exactamente 4 puntos válidos")
+			ctx.Status(gearbox.StatusBadRequest).SendString("Invalid points")
 			return
 		}
 
